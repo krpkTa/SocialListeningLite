@@ -1,142 +1,68 @@
 import { TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions";
 import { Api } from "telegram";
-import { SocialMediaService } from "./interfaces/SocialMediaService-interface";
-import { BasePost } from "./interfaces/base-post.interface";
-import { SearchParams, TelegramSearchParams } from "./interfaces/search-params";
-import { SocialPlatform } from "./interfaces/base-post.interface";
-import fs from "fs/promises";
 
-export class TelegramService implements SocialMediaService {
-    readonly platform: SocialPlatform = 'telegram';
-    private readonly client: TelegramClient;
-    private readonly maxRetries: number = 3;
-    private readonly reconnectDelay: number = 1000;
-    private isInitialized: boolean = false;
+const apiIdEnv = process.env.TELEGRAM_API_ID;
+const apiHashEnv = process.env.TELEGRAM_API_HASH;
 
-    constructor(
-        apiId: number,
-        apiHash: string,
-        session: string,
-    ) {
-        if (!apiId || !apiHash) {
-            throw new Error('API ID и API Hash обязательны для инициализации');
-        }
+if (!apiIdEnv || !apiHashEnv) {
+    throw new Error("TELEGRAM_API_ID и TELEGRAM_API_HASH должны быть заданы в .env");
+}
 
-        const stringSession = new StringSession(session || '');
-        this.client = new TelegramClient(stringSession, apiId, apiHash, {
-            connectionRetries: 5,
-            autoReconnect: true,
-            retryDelay: 1000,
-            deviceModel: 'Desktop',
-            systemVersion: 'Windows',
-            appVersion: '1.0.0',
-            langCode: 'en',
-            systemLangCode: 'en'
+const API_ID = Number(apiIdEnv);
+const API_HASH = apiHashEnv;
+
+// 1. Отправка кода на телефон
+export async function sendCode(phone: string) {
+    const client = new TelegramClient(new StringSession(""), API_ID, API_HASH, { connectionRetries: 5 });
+    await client.connect();
+    const result = await client.sendCode({
+        apiId:API_ID,
+        apiHash:API_HASH,
+    }, phone);
+
+    return {
+        phoneCodeHash: result.phoneCodeHash,
+        session: client.session.save(),
+    };
+}
+
+// 2. Подтверждение кода и (опционально) пароля 2FA
+export async function signInWithCode({ phone, code, session, password }: { phone: string, code: string, session: string, password?: string }) {
+    const client = new TelegramClient(new StringSession(session), API_ID, API_HASH, { connectionRetries: 5 });
+    await client.connect();
+    try {
+        await client.start({
+            phoneNumber: async () => phone,
+            phoneCode: async () => code,
+            password: async () => password || "",
+            onError: (err) => { throw err; },
         });
-    }
-
-    async init(): Promise<void> {
-        if (this.isInitialized) {
-            return;
+        return {
+            session: client.session.save(),
+        };
+    } catch (err: any) {
+        // Проверяем текст ошибки (может отличаться, проверьте в логах!)
+        if (err.message && err.message.includes("Password")) {
+            return { error: "SESSION_PASSWORD_NEEDED" };
         }
-
-        try {
-            await this.client.connect();
-
-            if (!await this.client.isUserAuthorized()) {
-                throw new Error('Пользователь не авторизован. Требуется интерактивная авторизация.');
-            }
-
-            this.isInitialized = true;
-        } catch (error) {
-            console.error('Ошибка при инициализации:', error);
-            throw error;
-        }
+        throw err;
     }
+}
 
-    async fetchPosts(params: SearchParams): Promise<BasePost[]> {
-        if (!this.isInitialized) {
-            await this.init();
-        }
-
-        if (!this.isTelegramParams(params)) {
-            throw new Error('Неверные параметры для Telegram сервиса');
-        }
-
-        return await this.retryOperation(async () => {
-            try {
-                if (!params.channelName) {
-                    throw new Error('Не указано имя канала');
-                }
-
-                const chat = await this.client.getEntity(params.channelName);
-                if (!chat) {
-                    throw new Error(`Канал ${params.channelName} не найден`);
-                }
-
-                const messages = await this.client.getMessages(chat, {
-                    limit: params.limit || 100,
-                    reverse: true
-                });
-
-                return messages
-                    .filter(message => message && message.text &&
-                        message.text.toLowerCase().includes(params.query.toLowerCase()))
-                    .map(message => ({
-                        id: message.id.toString(),
-                        content: message.text || '',
-                        createdAt: new Date(message.date * 1000),
-                        channelName: params.channelName,
-                        platform: 'telegram' as const
-                    }));
-            } catch (error) {
-                console.error("Ошибка при получении сообщений:", error);
-                throw error;
-            }
-        });
-    }
-
-    private async retryOperation<T>(operation: () => Promise<T>): Promise<T> {
-        let lastError: Error | null = null;
-
-        for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
-            try {
-                return await operation();
-            } catch (error: any) {
-                lastError = error;
-                console.error(`Попытка ${attempt} из ${this.maxRetries} не удалась:`, error.message);
-
-                if (attempt < this.maxRetries) {
-                    await new Promise(resolve => setTimeout(resolve, this.reconnectDelay));
-                    await this.reconnect();
-                }
-            }
-        }
-
-        throw lastError || new Error('Превышено количество попыток');
-    }
-
-    private async reconnect(): Promise<void> {
-        this.isInitialized = false;
-        try {
-            await this.client.disconnect();
-            await new Promise(resolve => setTimeout(resolve, this.reconnectDelay));
-            await this.init();
-        } catch (error) {
-            console.error('Ошибка при переподключении:', error);
-            throw error;
-        }
-    }
-
-    public isTelegramParams(params: SearchParams): params is TelegramSearchParams {
-        return 'channelName' in params;
-    }
-
-    async disconnect(): Promise<void> {
-        if (this.isInitialized) {
-            await this.client.disconnect();
-            this.isInitialized = false;
-        }
-    }
+// 3. Получение постов
+export async function getPosts({ session, channelName, query, limit = 100 }: { session: string, channelName: string, query: string, limit?: number }) {
+    const client = new TelegramClient(new StringSession(session), API_ID, API_HASH, { connectionRetries: 5 });
+    await client.connect();
+    const entity = await client.getEntity(channelName);
+    const messages = await client.getMessages(entity, { limit, reverse: true });
+    return messages
+        .filter((message: any) => message && message.text && message.text.toLowerCase().includes(query.toLowerCase()))
+        .map((message: any) => ({
+            id: message.id.toString(),
+            content: message.text || '',
+            createdAt: new Date(message.date * 1000),
+            channelName,
+            platform: 'telegram' as const
+        }));
 }
