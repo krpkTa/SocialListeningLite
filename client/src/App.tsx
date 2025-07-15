@@ -23,6 +23,13 @@ function TelegramAuthAndSearch() {
   const [password, setPassword] = React.useState("");
   const [showPassword, setShowPassword] = React.useState(false);
 
+  // Добавлено: если session есть в localStorage, сразу переходим на шаг 'search'
+  React.useEffect(() => {
+    if (session) {
+      setStep("search");
+    }
+  }, [session]);
+
   // 1. Отправка кода
   const handleSendCode = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
